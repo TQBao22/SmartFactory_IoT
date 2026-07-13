@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# Database & Logs
+central_server/logs/*.db
+logs/*.db
+*.log
+
+# Docker & MQTT Security
+mosquitto/config/pwfile
+
+# OS generated files
+.DS_Store
+Thumbs.db

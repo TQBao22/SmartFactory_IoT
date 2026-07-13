@@ -1,0 +1,16 @@
+services:
+  central_server:
+    build: ./central_server
+    container_name: smartfactory_central_server
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
+
+  mqtt_broker:
+    image: eclipse-mosquitto:2.0
+    container_name: smartfactory_mqtt
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+    restart: unless-stopped
