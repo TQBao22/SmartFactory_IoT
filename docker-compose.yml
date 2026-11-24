@@ -3,8 +3,15 @@ services:
     build: ./central_server
     container_name: smartfactory_central_server
     restart: unless-stopped
+    env_file: .env
+    environment:
+      # Ghi đè MQTT_HOST trong .env (giá trị đó dành cho edge chạy ngoài Docker)
+      - MQTT_HOST=mqtt_broker
+      - DB_PATH=/app/logs/factory_alerts.db
     volumes:
       - ./logs:/app/logs
+    depends_on:
+      - mqtt_broker
 
   mqtt_broker:
     image: eclipse-mosquitto:2.0
@@ -13,4 +20,5 @@ services:
       - "1883:1883"
     volumes:
       - ./mosquitto/config:/mosquitto/config
+      - ./mosquitto/data:/mosquitto/data
     restart: unless-stopped

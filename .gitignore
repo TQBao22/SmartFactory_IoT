@@ -17,3 +17,10 @@ mosquitto/config/pwfile
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Runtime data
+mosquitto/data/
+snapshots/
+
+# Video tổng hợp (tạo lại bằng edge_node/make_synthetic_video.py)
+edge_node/synthetic_scenario.mp4

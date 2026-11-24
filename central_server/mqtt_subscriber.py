@@ -1,130 +1,140 @@
+import html
 import json
-import requests
-import threading
 import os
+import threading
+import time
+from datetime import datetime, timedelta, timezone
+
 import paho.mqtt.client as mqtt
+import requests
+
 from database_handler import AlertDatabase
 
-# Cấu hình Telegram
-TELEGRAM_TOKEN = "8941449452:AAGBkSNRqmS3Avkw0mLZXojlbi1JgikVogM"
-TELEGRAM_CHAT_ID = "8891749804"
+# Bí mật và cấu hình đọc từ biến môi trường (file .env, xem .env.example). Không hardcode.
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+BROKER = os.environ.get("MQTT_HOST", "mqtt_broker")
+PORT = int(os.environ.get("MQTT_PORT", "1883"))
+MQTT_USER = os.environ.get("MQTT_USER", "")
+MQTT_PASS = os.environ.get("MQTT_PASS", "")
+DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                                 "logs", "factory_alerts.db"))
+LOCAL_TZ = timezone(timedelta(hours=float(os.environ.get("TZ_OFFSET_HOURS", "7"))))
 
-if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    print("[CẢNH BÁO] Cấu hình Telegram chưa đầy đủ. Hãy kiểm tra TELEGRAM_TOKEN và TELEGRAM_CHAT_ID.")
+TOPIC_PREFIX = "smartfactory/vntt/line1"
+EVENTS_TOPIC = f"{TOPIC_PREFIX}/events"
+STATUS_TOPIC = f"{TOPIC_PREFIX}/status/+"
+ZONE_EVENTS = {"OCCUPIED", "VACANT", "ALERT"}
+STATUS_EVENTS = {"ONLINE", "OFFLINE"}
 
-# Cấu hình MQTT
-BROKER = "mqtt_broker"
-PORT = 1883
-TOPIC = "smartfactory/vntt/line1/alerts"
+db = None
 
-# Logic kết nối SQLite động
-if os.path.exists("/.dockerenv"):
-    db_path = "/app/logs/factory_alerts.db"
-else:
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    db_path = os.path.join(base_dir, "logs", "factory_alerts.db")
 
-# Khởi tạo đối tượng xử lý CSDL
-db = AlertDatabase(db_path=db_path)
+def _is_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _is_name(v):
+    return isinstance(v, str) and 0 < len(v) <= 64
+
+
+def parse_message(topic, payload):
+    """Kiểm tra bản tin từ edge (dữ liệu không tin cậy). Hợp lệ -> dict, không hợp lệ -> None."""
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not _is_name(data.get("camera_id")) or not _is_number(data.get("ts")):
+        return None
+    ev = {"camera_id": data["camera_id"], "ts": float(data["ts"]), "event": data.get("event")}
+    if topic == EVENTS_TOPIC:
+        if ev["event"] not in ZONE_EVENTS or not _is_name(data.get("zone_id")):
+            return None
+        ev["zone_id"] = data["zone_id"]
+        if _is_number(data.get("absent_s")):
+            ev["absent_s"] = float(data["absent_s"])
+    elif topic.startswith(f"{TOPIC_PREFIX}/status/"):
+        if ev["event"] not in STATUS_EVENTS:
+            return None
+    else:
+        return None
+    return ev
+
+
+def format_alert(ev):
+    """Nội dung Telegram cho ALERT / OFFLINE, None nếu sự kiện không cần báo."""
+    when = datetime.fromtimestamp(ev["ts"], LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    cam = html.escape(ev["camera_id"])
+    if ev["event"] == "ALERT":
+        zone = html.escape(ev["zone_id"])
+        absent = f"{ev['absent_s']:.0f}s" if "absent_s" in ev else "?"
+        return (f"🚨 <b>CẢNH BÁO NHÀ MÁY</b> 🚨\n\n⚠️ Trạm làm việc trống {absent}\n"
+                f"📍 Khu vực: {zone} ({cam})\n🕒 Thời gian: {when}")
+    if ev["event"] == "OFFLINE":
+        return f"📴 <b>CAMERA MẤT KẾT NỐI</b>\n\n📷 {cam}\n🕒 Thời gian: {when}\nHệ thống KHÔNG giám sát khu vực này."
+    return None
+
 
 def send_telegram_alert(message):
-    """
-    Gửi tin nhắn cảnh báo qua Telegram.
-    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[TELEGRAM] Chưa cấu hình TELEGRAM_TOKEN / TELEGRAM_CHAT_ID, bỏ qua.")
+        return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        if response.status_code == 200:
-            print("[TELEGRAM] Đã gửi tin nhắn cảnh báo thành công!")
-        else:
-            print(f"[TELEGRAM LỖI] HTTP Error {response.status_code}: {response.text}")
-    except Exception as e:
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=10)
+        print("[TELEGRAM] Đã gửi." if r.ok else f"[TELEGRAM LỖI] HTTP {r.status_code}: {r.text}")
+    except requests.RequestException as e:
         print(f"[TELEGRAM LỖI] {e}")
 
+
 def on_connect(client, userdata, flags, reason_code, properties=None):
-    """
-    Callback được gọi khi Client kết nối thành công tới Broker.
-    """
     if reason_code == 0:
-        print(f"[SERVER] Đã kết nối tới Broker {BROKER} thành công.")
-        # Subscribe vào topic ngay khi kết nối thành công
-        client.subscribe(TOPIC)
-        print(f"[SERVER] Đang lắng nghe trên Topic: {TOPIC}")
+        client.subscribe([(EVENTS_TOPIC, 1), (STATUS_TOPIC, 1)])
+        print(f"[SERVER] Đã kết nối {BROKER}, lắng nghe {EVENTS_TOPIC} và {STATUS_TOPIC} (QoS 1).")
     else:
         print(f"[SERVER] Kết nối thất bại, mã lỗi: {reason_code}")
 
+
+def on_connect_fail(client, userdata):
+    print(f"[SERVER] Không kết nối được tới {BROKER}:{PORT}, đang thử lại...")
+
+
 def on_message(client, userdata, msg):
-    """
-    Callback được gọi khi có bản tin (message) mới gửi tới Topic đã Subscribe.
-    """
-    try:
-        # Giải mã payload từ dạng byte sang chuỗi UTF-8
-        payload_str = msg.payload.decode("utf-8")
-        
-        # Parse chuỗi JSON thành Dictionary
-        data = json.loads(payload_str)
-        
-        # Trích xuất thông tin
-        timestamp = data.get("timestamp", "N/A")
-        camera_id = data.get("camera_id", "Unknown")
-        alert_type = data.get("event_type", "N/A")
-        
-        # In thông báo đẹp mắt ra console
-        print(f"\n" + "="*50)
-        print(f"[SERVER] Nhận cảnh báo từ {camera_id}")
-        print(f"Thời gian: {timestamp}")
-        print(f"Sự kiện: {alert_type}")
-        print("="*50)
-        
-        # Lưu dữ liệu vào SQLite
-        db.insert_alert(timestamp, camera_id, alert_type)
-        print("[DATABASE] Đã lưu bản ghi cảnh báo vào SQLite.")
-        
-        # Bắn cảnh báo Telegram nếu là Worker_Missing
-        if alert_type == "Worker_Missing":
-            zone_name = data.get("zone_name", camera_id)
-            message = f"🚨 <b>CẢNH BÁO AN NINH NHÀ MÁY</b> 🚨\n\n⚠️ Trạng thái: Nhân viên vắng mặt!\n📍 Khu vực: {zone_name}\n🕒 Thời gian: {timestamp}"
-            threading.Thread(target=send_telegram_alert, args=(message,), daemon=True).start()
-            
-    except json.JSONDecodeError:
-        print(f"[SERVER LỖI] Không thể parse JSON. Nội dung nhận được: {msg.payload}")
-    except Exception as e:
-        print(f"[SERVER LỖI] Có lỗi xảy ra khi xử lý bản tin: {e}")
+    # Bản tin retained là trạng thái cũ gửi lại khi subscribe — đã xử lý trước đó, bỏ qua để không lưu/báo trùng.
+    if msg.retain:
+        return
+    ev = parse_message(msg.topic, msg.payload)
+    if ev is None:
+        print(f"[SERVER] Bỏ qua bản tin không hợp lệ trên {msg.topic}: {msg.payload[:200]!r}")
+        return
+    print(f"[SERVER] {ev}")
+    db.insert_event(ev, received_at=time.time())
+    message = format_alert(ev)
+    if message:
+        threading.Thread(target=send_telegram_alert, args=(message,), daemon=True).start()
+
 
 def main():
-    """
-    Hàm khởi chạy Máy chủ Trung tâm (Central Server).
-    """
+    global db
     print("=== MÁY CHỦ TRUNG TÂM (CENTRAL SERVER) ĐANG KHỞI ĐỘNG ===")
-    
-    # Khởi tạo MQTT Client (Tương thích v2.x)
-    client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
-    
-    # Thiết lập các hàm callback
+    if not MQTT_USER or not MQTT_PASS:
+        raise SystemExit("[SERVER LỖI] Thiếu biến môi trường MQTT_USER / MQTT_PASS.")
+    db = AlertDatabase(DB_PATH)
+
+    # client_id cố định + clean_session=False: broker giữ bản tin QoS 1 khi server tạm tắt.
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="central-server", clean_session=False)
+    client.username_pw_set(MQTT_USER, MQTT_PASS)
     client.on_connect = on_connect
+    client.on_connect_fail = on_connect_fail
     client.on_message = on_message
-    
     try:
-        # Kết nối tới Broker
-        client.username_pw_set("admin", "admin123")
-        client.connect(BROKER, PORT, keepalive=60)
-        
-        # Duy trì trạng thái lắng nghe liên tục 24/7
-        print("[SERVER] Bắt đầu vòng lặp lắng nghe (loop_forever)...")
-        client.loop_forever()
-        
+        client.connect_async(BROKER, PORT, keepalive=60)
+        client.loop_forever(retry_first_connection=True)
     except KeyboardInterrupt:
         print("\n[SERVER] Đang dừng máy chủ...")
-    except Exception as e:
-        print(f"[SERVER LỖI] Lỗi hệ thống: {e}")
     finally:
         db.close()
-        print("[SERVER] Máy chủ đã dừng.")
+
 
 if __name__ == "__main__":
     main()

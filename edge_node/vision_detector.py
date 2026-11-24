@@ -1,226 +1,196 @@
 """
 vision_detector.py
-Giám sát camera thật (Real-time) tại trạm biên (Edge Node).
-Sử dụng Multi-Object Tracking (YOLOv8) với logic Zone-Centric: giám sát vùng làm việc,
-cảnh báo khi KHÔNG CÒN AI trong vùng ROI.
-Tối ưu hóa: Bỏ qua khung hình (Frame Skipping) và giảm kích thước ảnh đầu vào (imgsz=480).
+Trạm giám sát biên (Edge Node): YOLOv8 phát hiện người + ZoneMonitor, gửi sự kiện zone qua MQTT.
+
+Chạy camera thật:   python vision_detector.py --source 0
+Mô phỏng bằng video: python vision_detector.py --source test_video2.mp4
+Không có màn hình (Jetson/Pi): thêm --headless
+
+ROI lưu dạng {"Zone_1": [x, y, w, h], ...}. Mặc định:
+- camera: edge_node/roi_config.json
+- video:  <tên_video>_roi.json (ROI gắn với từng cảnh quay)
 """
 
-import cv2
-import time
-import os
+import argparse
 import json
+import os
+import time
 from datetime import datetime
-from mqtt_publisher import MQTTAlertPublisher
-from ultralytics import YOLO
 
-# Đường dẫn tuyệt đối
+import cv2
+
+from zone_monitor import ZoneMonitor, OCCUPIED, VACANT, ALERT
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BASE_DIR)
 ROOT_DIR = os.path.dirname(PROJECT_DIR)
 
-ROI_CONFIG_FILE = "roi_config.json"
+PERSON_CLASS = 0
+PERSON_CONF = 0.4   # ngưỡng tính là có người; 0.6 cũ loại người ngồi bị che (0.41-0.57). Chọn lại bằng evaluate.py
+SKIP_FRAMES = 2     # suy luận 1/3 số khung hình
 
-# Khởi tạo mô hình nhẹ YOLOv8s để chạy mượt trên webcam
-model = YOLO(os.path.join(ROOT_DIR, 'yolov8s.pt'))
 
-def setup_rois(cap):
-    if os.path.exists(ROI_CONFIG_FILE):
-        with open(ROI_CONFIG_FILE, "r") as f:
-            workzones = json.load(f)
-        print("[INFO] Đã load cấu hình ROI từ file.")
-        return workzones
-        
+def default_model_path(name="yolov8s.pt"):
+    local = os.path.join(ROOT_DIR, name)
+    return local if os.path.exists(local) else name  # ultralytics tự tải nếu không có file local
+
+
+def load_model(path):
+    from ultralytics import YOLO
+    return YOLO(path)
+
+
+def detect_people(model, frame, imgsz=480, conf=PERSON_CONF):
+    """Trả về [(x1, y1, x2, y2, confidence)] cho các người có độ tin cậy >= conf.
+
+    Dùng predict, không dùng track: ByteTrack bỏ mất người ngồi bị bàn/màn hình che
+    (test_video2: track 0/258 khung, predict 239/258). ID tracking không dùng cho logic zone.
+    """
+    results = model.predict(frame, conf=conf, imgsz=imgsz, classes=[PERSON_CLASS], verbose=False)
+    if not results or results[0].boxes is None:
+        return []
+    boxes = results[0].boxes
+    return [(x1, y1, x2, y2, round(c, 2))
+            for (x1, y1, x2, y2), c in zip(boxes.xyxy.int().cpu().tolist(), boxes.conf.cpu().tolist())]
+
+
+def zones_occupied(people, zones):
+    """Zone có người nếu tâm bounding box nằm trong ROI [x, y, w, h]."""
+    occupied = {z: False for z in zones}
+    for x1, y1, x2, y2, _ in people:
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        for z, (zx, zy, zw, zh) in zones.items():
+            if zx <= cx <= zx + zw and zy <= cy <= zy + zh:
+                occupied[z] = True
+    return occupied
+
+
+def setup_rois(cap, path, force=False):
+    if os.path.exists(path) and not force:
+        with open(path, "r", encoding="utf-8") as f:
+            print(f"[INFO] Đã load ROI từ {path}.")
+            return json.load(f)
+
     ret, frame = cap.read()
     if not ret:
-        print("[LỖI] Không thể đọc frame để thiết lập ROI.")
-        return {}
-        
-    print("[INFO] Vui lòng vẽ các vùng ROI, sau đó nhấn ENTER (hoặc SPACE).")
+        raise SystemExit("[LỖI] Không đọc được khung hình để thiết lập ROI.")
+    print("[INFO] Kéo thả để vẽ từng vùng, ENTER/SPACE để chốt 1 vùng, ESC để hoàn tất.")
     rois = cv2.selectROIs("Select ROIs", frame, showCrosshair=True, fromCenter=False)
     cv2.destroyWindow("Select ROIs")
-    
-    workzones = {}
-    for i, roi in enumerate(rois):
-        workzones[f"Zone_{i+1}"] = [int(roi[0]), int(roi[1]), int(roi[2]), int(roi[3])]
-        
-    with open(ROI_CONFIG_FILE, "w") as f:
-        json.dump(workzones, f, indent=4)
-    print("[INFO] Đã lưu cấu hình ROI mới.")
-    return workzones
+    zones = {f"Zone_{i + 1}": [int(v) for v in roi] for i, roi in enumerate(rois)}
+    if not zones:
+        raise SystemExit("[LỖI] Không có vùng nào được chọn.")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(zones, f, indent=4)
+    print(f"[INFO] Đã lưu ROI vào {path}.")
+    return zones
+
+
+def draw(frame, people, zones, occupied, monitor, now):
+    for x1, y1, x2, y2, conf in people:
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (200, 200, 200), 1)
+        cv2.putText(frame, f"{conf:.2f}", (x1 + 2, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    states = monitor.states()
+    for z, (zx, zy, zw, zh) in zones.items():
+        state, since = states[z]
+        if state == OCCUPIED or occupied.get(z):
+            color, text = (0, 255, 0), f"{z}: Co nguoi"
+        elif state == VACANT:
+            absent = now - since
+            color = (0, 0, 255) if absent >= monitor.alert_s else (0, 255, 255)
+            text = f"{z} Vang: {int(absent)}s"
+        else:
+            color, text = (200, 200, 200), f"{z}: ..."
+        cv2.rectangle(frame, (zx, zy), (zx + zw, zy + zh), color, 2)
+        cv2.putText(frame, text, (zx, zy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+
+def open_source(source):
+    cap = cv2.VideoCapture(int(source) if source.isdigit() else source)
+    if not cap.isOpened():
+        raise SystemExit(f"[LỖI] Không mở được nguồn video: {source}")
+    return cap
+
 
 def main():
-    publisher = MQTTAlertPublisher()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--source", default="0", help="chỉ số camera hoặc đường dẫn file video")
+    ap.add_argument("--roi", help="file ROI json")
+    ap.add_argument("--model", default=default_model_path())
+    ap.add_argument("--camera-id", default="Cam-01")
+    ap.add_argument("--imgsz", type=int, default=480)
+    ap.add_argument("--conf", type=float, default=PERSON_CONF, help="ngưỡng tin cậy tính là có người (chọn bằng evaluate.py)")
+    ap.add_argument("--headless", action="store_true", help="không hiển thị cửa sổ")
+    args = ap.parse_args()
 
-    SNAPSHOT_DIR = os.path.join(PROJECT_DIR, "snapshots")
-    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    from mqtt_publisher import MQTTAlertPublisher
 
-    # Mở camera mặc định
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[LỖI] Không thể mở camera mặc định.")
-        return
+    is_video = not args.source.isdigit()
+    roi_path = args.roi or (os.path.splitext(args.source)[0] + "_roi.json" if is_video
+                            else os.path.join(BASE_DIR, "roi_config.json"))
+    if args.headless and not os.path.exists(roi_path):
+        raise SystemExit(f"[LỖI] --headless cần file ROI có sẵn ({roi_path}); chạy một lần có màn hình để vẽ zone.")
+    snapshot_dir = os.path.join(PROJECT_DIR, "snapshots")
+    os.makedirs(snapshot_dir, exist_ok=True)
 
-    WORKZONES = setup_rois(cap)
+    model = load_model(args.model)
+    publisher = MQTTAlertPublisher(camera_id=args.camera_id)
+    cap = open_source(args.source)
+    zones = setup_rois(cap, roi_path)
 
-    # Biến trạng thái giám sát vùng
-    MISSING_THRESHOLD = 10.0
-    DWELL_THRESHOLD = 3
-    last_seen_times = {zone: time.time() for zone in WORKZONES}
-    zone_dwell_trackers = {}
-    is_alerted = {zone: False for zone in WORKZONES}
-    worker_in_zone = {zone: False for zone in WORKZONES}
-
-    # Cấu hình Frame Skipping
-    frame_count = 0
-    SKIP_FRAMES = 2
-    latest_detections = []
-    cached_worker_in_zone = {zone: False for zone in WORKZONES}
-
-    print("\n=== TRẠM GIÁM SÁT BIÊN (ZONE-CENTRIC TRACKING - TỐI ƯU HÓA) ĐÃ KHỞI ĐỘNG ===")
-    print("Nhấn 'q' để thoát, 'r' để reset ROI.\n")
+    # Video: dùng thời gian nội tại video (neo vào giờ thật lúc bắt đầu) để kết quả không phụ thuộc tốc độ máy.
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    t0 = time.time()
+    monitor = ZoneMonitor(zones, start=t0)
+    frame_idx, people, occupied = 0, [], {}
+    print(f"\n=== TRẠM GIÁM SÁT BIÊN: {len(zones)} vùng, nguồn {args.source} ===  'q' thoát, 'r' vẽ lại ROI\n")
 
     while True:
-        # Luôn đọc frame để xả buffer
         ret, frame = cap.read()
         if not ret:
-            print("[LỖI] Không thể đọc khung hình từ camera.")
-            break
+            if is_video:
+                print("[INFO] Hết video.")
+                break
+            print("[LỖI] Mất tín hiệu camera, thử mở lại sau 2s...")
+            cap.release()
+            time.sleep(2)
+            cap = cv2.VideoCapture(int(args.source))
+            continue
 
-        frame_count += 1
-        height, width, _ = frame.shape
+        frame_idx += 1
+        now = t0 + frame_idx / fps if is_video else time.time()
+        if is_video and now > time.time():
+            time.sleep(now - time.time())  # phát video đúng tốc độ thật để mô phỏng camera (timestamp không vượt giờ thật)
 
-        # Logic Inference ngắt quãng
-        if frame_count % (SKIP_FRAMES + 1) == 0:
-            cached_worker_in_zone = {zone: False for zone in WORKZONES}
-            latest_detections = []
-
+        if frame_idx % (SKIP_FRAMES + 1) == 0:
             try:
-                # Tracking với YOLOv8 (imgsz=480 để chạy nhanh hơn)
-                results = model.track(frame, persist=True, conf=0.35, imgsz=480, verbose=False)
-
-                if results and len(results) > 0 and results[0].boxes is not None:
-                    boxes = results[0].boxes
-
-                    # Kiểm tra tracker có gán được ID chưa
-                    has_ids = boxes.id is not None
-                    if has_ids:
-                        track_ids = boxes.id.int().cpu().tolist()
-
-                    class_ids = boxes.cls.int().cpu().tolist()
-                    confidences = boxes.conf.cpu().tolist()
-                    xyxy_list = boxes.xyxy.int().cpu().tolist()
-
-                    for i in range(len(class_ids)):
-                        class_id = class_ids[i]
-                        confidence = confidences[i]
-
-                        # Chỉ xử lý đối tượng "Người" với confidence > 0.6
-                        if class_id != 0 or confidence <= 0.6:
-                            continue
-
-                        bx1, by1, bx2, by2 = xyxy_list[i]
-                        center_x = (bx1 + bx2) // 2
-                        center_y = (by1 + by2) // 2
-                        
-                        in_any_roi = False
-                        for zone_name, (zx, zy, zw, zh) in WORKZONES.items():
-                            if zx <= center_x <= zx + zw and zy <= center_y <= zy + zh:
-                                cached_worker_in_zone[zone_name] = True
-                                in_any_roi = True
-
-                        tid = track_ids[i] if has_ids else "?"
-                        latest_detections.append((bx1, by1, bx2, by2, tid, in_any_roi))
-
-            except Exception as e:
+                people = detect_people(model, frame, imgsz=args.imgsz, conf=args.conf)
+            except Exception as e:  # lỗi suy luận 1 khung hình không được dừng cả trạm
                 print(f"[LỖI] Tracking: {e}")
+                people = []
+            occupied = zones_occupied(people, zones)
+            for ev in monitor.update(occupied, now):
+                publisher.publish_event(ev)
+                print(f"[SỰ KIỆN] {ev}")
+                if ev["event"] == ALERT:
+                    fname = f"missing_{ev['zone_id']}_{datetime.now():%Y%m%d_%H%M%S}.jpg"
+                    cv2.imwrite(os.path.join(snapshot_dir, fname), frame)
 
-        # Vẽ Bounding Box từ latest_detections (Áp dụng cho cả frame không chạy inference)
-        for bx1, by1, bx2, by2, tid, in_roi in latest_detections:
-            box_color = (0, 255, 0) if in_roi else (200, 200, 200)
-            box_thick = 2 if in_roi else 1
-            label = f"ID:{tid}"
-
-            cv2.rectangle(frame, (bx1, by1), (bx2, by2), box_color, box_thick)
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(frame, (bx1, by1 - th - 8), (bx1 + tw + 4, by1), box_color, -1)
-            cv2.putText(frame, label, (bx1 + 2, by1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-
-        # ======== LOGIC BÁO ĐỘNG ZONE-CENTRIC ========
-        for zone_name, (zx, zy, zw, zh) in WORKZONES.items():
-            if cached_worker_in_zone.get(zone_name, False):
-                if zone_name not in zone_dwell_trackers:
-                    zone_dwell_trackers[zone_name] = time.time()
-                
-                dwell_time = time.time() - zone_dwell_trackers[zone_name]
-                if dwell_time >= DWELL_THRESHOLD:
-                    last_seen_times[zone_name] = time.time()
-                
-                is_alerted[zone_name] = False
-                border_color = (0, 255, 0)
-                border_thick = 2
-                status = f"{zone_name}: Co nguoi"
-            else:
-                if zone_name in zone_dwell_trackers:
-                    del zone_dwell_trackers[zone_name]
-                    
-                time_missing = time.time() - last_seen_times[zone_name]
-
-                if time_missing > MISSING_THRESHOLD and not is_alerted[zone_name]:
-                    # BÁO ĐỘNG
-                    border_color = (0, 0, 255)
-                    border_thick = 3
-                    status = f"{zone_name} Vang: {int(time_missing)}s"
-
-                    print(f"[CẢNH BÁO] {zone_name} trống quá {MISSING_THRESHOLD}s!")
-
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    fname = f"missing_{zone_name}_{ts}.jpg"
-                    cv2.imwrite(os.path.join(SNAPSHOT_DIR, fname), frame)
-                    print(f"[CAMERA] Snapshot: {fname}")
-
-                    # Tạm thời đổi camera_id thành zone_name để gửi zone_name lên broker
-                    old_id = publisher.camera_id
-                    publisher.camera_id = zone_name
-                    publisher.publish_alert(alert_type="Worker_Missing")
-                    publisher.camera_id = old_id
-                    
-                    is_alerted[zone_name] = True
-
-                elif time_missing > MISSING_THRESHOLD:
-                    # Đã báo động rồi, giữ viền đỏ
-                    border_color = (0, 0, 255)
-                    border_thick = 3
-                    status = f"{zone_name} Vang: {int(time_missing)}s"
-                else:
-                    # Cảnh báo nhẹ
-                    border_color = (0, 255, 255)
-                    border_thick = 2
-                    status = f"Vang mat: {int(time_missing)}s"
-
-            # Vẽ ROI và trạng thái
-            cv2.rectangle(frame, (zx, zy), (zx + zw, zy + zh), border_color, border_thick)
-            cv2.putText(frame, status, (zx, zy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, border_color, 2)
-
-        cv2.imshow("Giam sat Bien - SmartFactory (Zone-Centric)", frame)
-
+        if args.headless:
+            continue
+        draw(frame, people, zones, occupied, monitor, now)
+        cv2.imshow("Giam sat Bien - SmartFactory", frame)
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            print("Đang đóng trạm giám sát...")
+        if key == ord("q"):
             break
-        elif key == ord('r'):
-            if os.path.exists(ROI_CONFIG_FILE):
-                os.remove(ROI_CONFIG_FILE)
-            WORKZONES = setup_rois(cap)
-            last_seen_times = {zone: time.time() for zone in WORKZONES}
-            zone_dwell_trackers = {}
-            is_alerted = {zone: False for zone in WORKZONES}
-            worker_in_zone = {zone: False for zone in WORKZONES}
-            cached_worker_in_zone = {zone: False for zone in WORKZONES}
+        if key == ord("r"):
+            zones = setup_rois(cap, roi_path, force=True)
+            monitor.reset(zones, now)
 
     cap.release()
     publisher.disconnect()
     cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()

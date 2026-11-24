@@ -1,55 +1,45 @@
-import sqlite3
 import os
+import sqlite3
+import time
+
 
 class AlertDatabase:
     """
-    Lớp xử lý tương tác với Cơ sở dữ liệu SQLite để lưu trữ các cảnh báo từ hệ thống.
-    """
-    def __init__(self, db_path="SmartFactory_IoT/logs/factory_alerts.db"):
-        """
-        Khởi tạo kết nối CSDL và tạo bảng nếu chưa tồn tại.
-        
-        Args:
-            db_path (str): Đường dẫn tới file CSDL SQLite.
-        """
-        # Đảm bảo thư mục chứa log tồn tại
-        db_dir = os.path.dirname(db_path)
-        if not os.path.exists(db_dir):
-            os.makedirs(db_dir)
-            
-        self.db_path = db_path
-        
-        try:
-            # Kết nối tới SQLite (file sẽ được tạo nếu chưa có)
-            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            self.cursor = self.conn.cursor()
-            
-            # Tạo bảng alerts nếu chưa tồn tại
-            self.cursor.execute('''
-                CREATE TABLE IF NOT EXISTS alerts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    camera_id TEXT NOT NULL,
-                    alert_type TEXT NOT NULL
-                )
-            ''')
-            self.conn.commit()
-            print(f"[DATABASE] Đã kết nối thành công tới CSDL: {self.db_path}")
-        except sqlite3.Error as e:
-            print(f"[DATABASE LỖI] Không thể khởi tạo CSDL: {e}")
+    Lưu sự kiện từ edge vào SQLite.
 
-    def insert_alert(self, timestamp, camera_id, alert_type):
-        """
-        Thêm một bản ghi cảnh báo mới vào CSDL.
-        
-        Args:
-            timestamp (str): Thời gian xảy ra cảnh báo.
-            camera_id (str): ID của camera phát hiện.
-            alert_type (str): Loại cảnh báo.
-        """
+    Bảng `events`: mỗi dòng là một lần đổi trạng thái zone (OCCUPIED / VACANT / ALERT)
+    hoặc trạng thái camera (ONLINE / OFFLINE, zone_id = NULL).
+    `ts` là thời điểm xảy ra (epoch giây, do edge đo), `received_at` là lúc server nhận —
+    hiệu hai cột cho độ trễ truyền tin.
+    Bảng `alerts` cũ (v1.0) giữ nguyên, không đọc/ghi nữa.
+    """
+
+    def __init__(self, db_path):
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        self.db_path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts          REAL NOT NULL,
+                camera_id   TEXT NOT NULL,
+                zone_id     TEXT,
+                event       TEXT NOT NULL,
+                absent_s    REAL,
+                received_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_cam_zone_ts ON events(camera_id, zone_id, ts);
+        """)
+        self.conn.commit()
+        print(f"[DATABASE] Đã kết nối CSDL: {db_path}")
+
+    def insert_event(self, ev, received_at=None):
         try:
-            query = "INSERT INTO alerts (timestamp, camera_id, alert_type) VALUES (?, ?, ?)"
-            self.cursor.execute(query, (timestamp, camera_id, alert_type))
+            self.conn.execute(
+                "INSERT INTO events (ts, camera_id, zone_id, event, absent_s, received_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (ev["ts"], ev["camera_id"], ev.get("zone_id"), ev["event"], ev.get("absent_s"),
+                 received_at or time.time()),
+            )
             self.conn.commit()
             return True
         except sqlite3.Error as e:
@@ -57,13 +47,5 @@ class AlertDatabase:
             return False
 
     def close(self):
-        """Đóng kết nối CSDL."""
-        if self.conn:
-            self.conn.close()
-            print("[DATABASE] Đã đóng kết nối CSDL.")
-
-if __name__ == "__main__":
-    # Test nhanh CSDL
-    db = AlertDatabase()
-    db.insert_alert("2026-07-02 21:00:00", "Cam-Test", "test_connection")
-    db.close()
+        self.conn.close()
+        print("[DATABASE] Đã đóng kết nối CSDL.")

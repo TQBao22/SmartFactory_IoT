@@ -1,94 +1,71 @@
 import json
-from datetime import datetime
+import os
+import time
 import paho.mqtt.client as mqtt
+
+TOPIC_PREFIX = "smartfactory/vntt/line1"
+
 
 class MQTTAlertPublisher:
     """
-    Lớp kết nối thực tế tới MQTT Broker trên Cloud để gửi các bản tin cảnh báo xâm nhập.
-    Sử dụng Public Broker: broker.emqx.io:1883
+    Gửi sự kiện zone (OCCUPIED / VACANT / ALERT) và trạng thái online/offline của camera lên MQTT Broker.
+
+    Cấu hình qua biến môi trường: MQTT_HOST (mặc định 127.0.0.1), MQTT_PORT (1883), MQTT_USER, MQTT_PASS.
+    - Topic sự kiện: smartfactory/vntt/line1/events   (QoS 1)
+    - Topic trạng thái: smartfactory/vntt/line1/status/<camera_id>  (retained, LWT = offline)
     """
-    def __init__(self, broker="127.0.0.1", port=1883, camera_id="Cam-01"):
-        """
-        Khởi tạo đối tượng MQTT Publisher và thiết lập kết nối tới Broker.
-        
-        Args:
-            broker (str): Địa chỉ Public Broker. Mặc định là 'broker.emqx.io'.
-            port (int): Cổng kết nối MQTT. Mặc định là 1883.
-            camera_id (str): Định danh của camera. Mặc định là 'Cam-01'.
-        """
-        self.broker = broker
-        self.port = port
+
+    def __init__(self, camera_id="Cam-01"):
         self.camera_id = camera_id
-        self.topic = "smartfactory/vntt/line1/alerts"
-        
-        # Khởi tạo MQTT Client tương thích với cả paho-mqtt v1.x và v2.x
+        self.events_topic = f"{TOPIC_PREFIX}/events"
+        self.status_topic = f"{TOPIC_PREFIX}/status/{camera_id}"
+        host = os.environ.get("MQTT_HOST", "127.0.0.1")
+        port = int(os.environ.get("MQTT_PORT", "1883"))
+        user, password = os.environ.get("MQTT_USER"), os.environ.get("MQTT_PASS")
+        if not user or not password:
+            raise SystemExit("[MQTT LỖI] Thiếu biến môi trường MQTT_USER / MQTT_PASS.")
+
         try:
             # paho-mqtt v2.x yêu cầu chỉ định rõ CallbackAPIVersion
-            self.client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+            self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=f"edge-{camera_id}")
         except AttributeError:
-            # Hỗ trợ tương thích ngược cho paho-mqtt v1.x cũ hơn
-            self.client = mqtt.Client()
-            
-        print(f"[MQTT] Đang kết nối tới Broker: {self.broker}:{self.port}...")
-        
-        try:
-            self.client.username_pw_set("admin", "admin123")
-            self.client.connect(self.broker, self.port, keepalive=60)
-            # Khởi động luồng chạy ngầm để duy trì kết nối (keepalive) và xử lý dữ liệu truyền/nhận
-            self.client.loop_start()
-            print("[MQTT] Kết nối thành công và đã kích hoạt loop_start.")
-        except Exception as e:
-            print(f"[MQTT LỖI] Không thể kết nối tới Broker: {e}")
+            # paho-mqtt v1.x
+            self.client = mqtt.Client(client_id=f"edge-{camera_id}")
 
-    def publish_alert(self, alert_type="Intrusion_Detected"):
-        """
-        Đóng gói thông tin cảnh báo thành JSON payload và gửi tới topic định nghĩa trên Broker.
-        
-        Args:
-            alert_type (str): Loại cảnh báo sự kiện. Mặc định là 'Intrusion_Detected'.
-        """
-        # Lấy mốc thời gian hiện tại
-        current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Cấu trúc JSON payload
-        payload = {
-            "timestamp": current_timestamp,
-            "camera_id": self.camera_id,
-            "event_type": alert_type
-        }
-        
-        # Chuyển đổi sang dạng chuỗi JSON UTF-8
-        json_payload = json.dumps(payload, ensure_ascii=False)
-        
-        try:
-            # Xuất bản bản tin lên Topic
-            result = self.client.publish(self.topic, json_payload, qos=1)
-            # Chờ bản tin được gửi đi thành công (đối với QoS 1)
-            result.wait_for_publish(timeout=2.0)
-            print("[MQTT] Đã gửi bản tin cảnh báo lên Cloud.")
-        except Exception as e:
-            print(f"[MQTT LỖI] Gửi bản tin thất bại: {e}")
-            
-        return json_payload
+        self.client.username_pw_set(user, password)
+        # Nếu edge chết / mất mạng, broker tự báo offline cho server.
+        self.client.will_set(self.status_topic, self._status("offline"), qos=1, retain=True)
+        self.client.on_connect = self._on_connect
+        self.client.on_connect_fail = lambda client, userdata: print(f"[MQTT] Không kết nối được tới {host}:{port}, đang thử lại...")
+        # connect_async + loop_start: tự kết nối lại khi broker chưa sẵn sàng hoặc rớt mạng.
+        self.client.connect_async(host, port, keepalive=30)
+        self.client.loop_start()
+        print(f"[MQTT] Đang kết nối tới Broker: {host}:{port}...")
+
+    def _status(self, status):
+        return json.dumps({"camera_id": self.camera_id, "event": status.upper(), "ts": time.time()})
+
+    def _on_connect(self, client, userdata, flags, reason_code, properties=None):
+        if reason_code == 0:
+            client.publish(self.status_topic, self._status("online"), qos=1, retain=True)
+            print("[MQTT] Đã kết nối, camera ONLINE.")
+        else:
+            print(f"[MQTT LỖI] Kết nối thất bại: {reason_code}")
+
+    def publish_event(self, event):
+        """event: dict từ ZoneMonitor ({zone_id, event, ts, ...}). Không chặn vòng lặp video."""
+        payload = json.dumps({"camera_id": self.camera_id, **event}, ensure_ascii=False)
+        info = self.client.publish(self.events_topic, payload, qos=1)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            print(f"[MQTT] Chưa kết nối (rc={info.rc}), bản tin chờ gửi lại: {payload}")
+        return payload
 
     def disconnect(self):
-        """
-        Hàm giải phóng tài nguyên và ngắt kết nối an toàn khi tắt ứng dụng.
-        """
+        # Ngắt kết nối chủ động không kích hoạt LWT, nên tự báo offline.
+        try:
+            self.client.publish(self.status_topic, self._status("offline"), qos=1, retain=True).wait_for_publish(2)
+        except (RuntimeError, ValueError) as e:
+            print(f"[MQTT] Không gửi được trạng thái offline: {e}")
         self.client.loop_stop()
         self.client.disconnect()
         print("[MQTT] Đã ngắt kết nối an toàn.")
-
-
-# Khối chạy thử nghiệm độc lập
-if __name__ == "__main__":
-    import time
-    # Khởi tạo publisher kết nối tới Cloud Broker
-    publisher = MQTTAlertPublisher()
-    
-    print("Gửi thử nghiệm bản tin cảnh báo lên Cloud...")
-    publisher.publish_alert("Intrusion_Detected")
-    
-    # Chờ 1 giây để bảo đảm gói tin được truyền đi hoàn tất trước khi ngắt kết nối
-    time.sleep(1)
-    publisher.disconnect()
