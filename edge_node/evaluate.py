@@ -3,9 +3,10 @@ evaluate.py — đo độ chính xác và tốc độ của pipeline edge trên 
 
     python evaluate.py                                  # split dev, model mặc định
     python evaluate.py --model ../../yolov8n.pt --append --note "thử bản nano"
+    python evaluate.py --split all --alert-s 60   # video ngắn: rút ngưỡng đỗ quá giờ để có cảnh báo mà chấm
     python evaluate.py --split test --append --note "chốt cấu hình v1.1"   # test: chỉ chạy khi đã chốt
 
-Nhãn tạo bằng label_video.py. Chạy đúng pipeline thật (detect_people -> zones_occupied -> ZoneMonitor)
+Nhãn tạo bằng label_video.py. Chạy đúng pipeline thật (detect_vehicles -> zones_occupied -> ZoneMonitor)
 nhưng dùng thời gian video, không gửi MQTT.
 """
 import argparse
@@ -19,14 +20,15 @@ from datetime import date
 import cv2
 
 from eval_metrics import aggregate, score_zone
-from vision_detector import PERSON_CONF, SKIP_FRAMES, default_model_path, detect_people, load_model, zones_occupied
+from vision_detector import (DETECT_CONF, DETECT_EVERY_S, IMGSZ, ZONE_IOU, default_model_path, detect_vehicles,
+                             load_model, zones_occupied)
 from zone_monitor import ZoneMonitor
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LABELS_DIR = os.path.join(PROJECT_DIR, "eval", "labels")
 RESULTS = os.path.join(PROJECT_DIR, "eval", "RESULTS.md")
 HEADER = ("| ngày | model | imgsz | conf | enter/leave/alert (s) | split | số video | P | R | F1 | báo giả/zone-giờ "
-          "| trễ báo TB (s) | khớp trạng thái | sai số có mặt (điểm %) | suy luận p50 (ms) | FPS | ghi chú |\n"
+          "| trễ báo TB (s) | khớp trạng thái | sai số lấp đầy (điểm %) | suy luận p50 (ms) | FPS | ghi chú |\n"
           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n")
 
 
@@ -38,22 +40,23 @@ def run_video(model, label, args):
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     monitor = ZoneMonitor(zones, args.enter_s, args.leave_s, args.alert_s, start=0.0)
     limit = label.get("duration_s", float("inf"))
-    events, infer_ms, frame_idx = [], [], 0
+    events, infer_ms, frame_idx, last_detect = [], [], 0, float("-inf")
     wall_start = time.perf_counter()
     while True:
         ret, frame = cap.read()
         if not ret or (frame_idx + 1) / fps > limit:
             break
         frame_idx += 1
-        if frame_idx % (SKIP_FRAMES + 1):
+        if frame_idx / fps - last_detect < args.every_s:
             continue
+        last_detect = frame_idx / fps
         t = time.perf_counter()
-        people = detect_people(model, frame, imgsz=args.imgsz, conf=args.conf)
+        boxes = detect_vehicles(model, frame, imgsz=args.imgsz, conf=args.conf)
         infer_ms.append(1000 * (time.perf_counter() - t))
-        events += monitor.update(zones_occupied(people, zones), frame_idx / fps)
+        events += monitor.update(zones_occupied(boxes, zones, args.iou), frame_idx / fps)
     cap.release()
     duration = frame_idx / fps
-    per_zone = [score_zone(label["absences"].get(z, []), [e for e in events if e["zone_id"] == z], duration, args.alert_s)
+    per_zone = [score_zone(label["parked"].get(z, []), [e for e in events if e["zone_id"] == z], duration, args.alert_s)
                 for z in zones]
     return per_zone, events, infer_ms, frame_idx / (time.perf_counter() - wall_start)
 
@@ -65,13 +68,15 @@ def fmt(v, pattern="{:.2f}"):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--labels", default=LABELS_DIR)
-    ap.add_argument("--split", default="dev", choices=["dev", "test", "synthetic", "all"])
+    ap.add_argument("--split", default="dev", choices=["dev", "test", "all"])
     ap.add_argument("--model", default=default_model_path())
-    ap.add_argument("--imgsz", type=int, default=480)
-    ap.add_argument("--conf", type=float, default=PERSON_CONF, help="ngưỡng tin cậy tính là có người")
-    ap.add_argument("--enter-s", type=float, default=3.0)
-    ap.add_argument("--leave-s", type=float, default=2.0)
-    ap.add_argument("--alert-s", type=float, default=10.0)
+    ap.add_argument("--imgsz", type=int, default=IMGSZ)
+    ap.add_argument("--every-s", type=float, default=DETECT_EVERY_S, help="khoảng cách giữa hai lần suy luận (giây video)")
+    ap.add_argument("--conf", type=float, default=DETECT_CONF, help="ngưỡng tin cậy tính là có xe")
+    ap.add_argument("--iou", type=float, default=ZONE_IOU, help="IoU tối thiểu giữa xe và chỗ đỗ")
+    ap.add_argument("--enter-s", type=float, default=10.0)
+    ap.add_argument("--leave-s", type=float, default=10.0)
+    ap.add_argument("--alert-s", type=float, default=7200.0)
     ap.add_argument("--append", action="store_true", help="ghi một dòng vào eval/RESULTS.md")
     ap.add_argument("--note", default="")
     args = ap.parse_args()
@@ -103,7 +108,7 @@ def main():
     fps = statistics.mean(fps_list)
     print(f"\nP={fmt(a['precision'])} R={fmt(a['recall'])} F1={fmt(a['f1'])} "
           f"báo giả/zone-giờ={fmt(a['false_alarms_per_zone_hour'], '{:.1f}')} trễ báo TB={fmt(a['latency_mean_s'], '{:.1f}')}s "
-          f"khớp trạng thái={fmt(a['occ_accuracy'], '{:.1%}')} sai số có mặt={fmt(a['occ_pct_error'], '{:+.1f}')} điểm % "
+          f"khớp trạng thái={fmt(a['occ_accuracy'], '{:.1%}')} sai số lấp đầy={fmt(a['occ_pct_error'], '{:+.1f}')} điểm % "
           f"suy luận p50={fmt(p50, '{:.0f}')}ms FPS={fps:.1f}")
 
     print("\nVideo sai nhiều nhất (FP+FN):")

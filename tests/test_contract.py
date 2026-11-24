@@ -16,9 +16,9 @@ class ContractTest(unittest.TestCase):
         os.environ.update(MQTT_HOST="127.0.0.1", MQTT_PORT="1", MQTT_USER="u", MQTT_PASS="p")  # không có broker
         pub = MQTTAlertPublisher(camera_id="Cam-01")
         try:
-            m = ZoneMonitor(["Zone_1"], start=1000.0)
+            m = ZoneMonitor(["Zone_1"], enter_s=3, leave_s=2, alert_s=5, start=1000.0)
             events = []
-            for i in range(400):  # có người 0-10s, vắng 10-30s, quay lại
+            for i in range(400):  # có xe 0-10s, trống 10-30s, xe khác đến
                 t = 1000.0 + i * 0.1
                 events += m.update({"Zone_1": not (10 <= i * 0.1 < 30)}, t)
             self.assertEqual({e["event"] for e in events}, {"OCCUPIED", "VACANT", "ALERT"})

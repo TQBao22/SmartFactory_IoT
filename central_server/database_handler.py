@@ -25,7 +25,7 @@ class AlertDatabase:
                 camera_id   TEXT NOT NULL,
                 zone_id     TEXT,
                 event       TEXT NOT NULL,
-                absent_s    REAL,
+                duration_s  REAL,
                 received_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_events_cam_zone_ts ON events(camera_id, zone_id, ts);
@@ -36,8 +36,8 @@ class AlertDatabase:
     def insert_event(self, ev, received_at=None):
         try:
             self.conn.execute(
-                "INSERT INTO events (ts, camera_id, zone_id, event, absent_s, received_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (ev["ts"], ev["camera_id"], ev.get("zone_id"), ev["event"], ev.get("absent_s"),
+                "INSERT INTO events (ts, camera_id, zone_id, event, duration_s, received_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (ev["ts"], ev["camera_id"], ev.get("zone_id"), ev["event"], ev.get("duration_s"),
                  received_at or time.time()),
             )
             self.conn.commit()

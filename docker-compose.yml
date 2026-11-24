@@ -7,7 +7,7 @@ services:
     environment:
       # Ghi đè MQTT_HOST trong .env (giá trị đó dành cho edge chạy ngoài Docker)
       - MQTT_HOST=mqtt_broker
-      - DB_PATH=/app/logs/factory_alerts.db
+      - DB_PATH=/app/logs/parking.db
     volumes:
       - ./logs:/app/logs
     depends_on:

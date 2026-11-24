@@ -1,12 +1,12 @@
 """
 vision_detector.py
-Trạm giám sát biên (Edge Node): YOLOv8 phát hiện người + ZoneMonitor, gửi sự kiện zone qua MQTT.
+Trạm giám sát biên (Edge Node): YOLOv8 phát hiện xe + ZoneMonitor theo từng chỗ đỗ, gửi sự kiện qua MQTT.
 
 Chạy camera thật:   python vision_detector.py --source 0
-Mô phỏng bằng video: python vision_detector.py --source test_video2.mp4
+Mô phỏng bằng video: python vision_detector.py --source bai_xe.mp4
 Không có màn hình (Jetson/Pi): thêm --headless
 
-ROI lưu dạng {"Zone_1": [x, y, w, h], ...}. Mặc định:
+Chỗ đỗ lưu dạng {"Slot_1": [x, y, w, h] hoặc [[x, y], [x, y], ...] (đa giác)}. Mặc định:
 - camera: edge_node/roi_config.json
 - video:  <tên_video>_roi.json (ROI gắn với từng cảnh quay)
 """
@@ -18,6 +18,7 @@ import time
 from datetime import datetime
 
 import cv2
+import numpy as np
 
 from zone_monitor import ZoneMonitor, OCCUPIED, VACANT, ALERT
 
@@ -25,9 +26,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BASE_DIR)
 ROOT_DIR = os.path.dirname(PROJECT_DIR)
 
-PERSON_CLASS = 0
-PERSON_CONF = 0.4   # ngưỡng tính là có người; 0.6 cũ loại người ngồi bị che (0.41-0.57). Chọn lại bằng evaluate.py
-SKIP_FRAMES = 2     # suy luận 1/3 số khung hình
+VEHICLE_CLASSES = [2, 3, 5, 7]  # COCO: car, motorcycle, bus, truck
+# Chọn trên PKLot dev (eval/RESULTS_PKLOT.md): conf thấp vẫn giữ P ~0.997 vì bước gán chỗ đỗ lọc nhiễu.
+DETECT_CONF = 0.05  # ngưỡng tin cậy tính là có xe
+ZONE_IOU = 0.2      # IoU tối thiểu giữa bbox xe và chỗ đỗ
+IMGSZ = 1280        # 640 bỏ sót xe ở xa (PUCPR recall 0.03 so với 0.65 ở 1280)
+DETECT_EVERY_S = 1.0  # bãi đỗ đổi trạng thái chậm: suy luận 1 lần/giây là đủ, đủ thời gian cho ảnh 1280 trên CPU
 
 
 def default_model_path(name="yolov8s.pt"):
@@ -40,13 +44,12 @@ def load_model(path):
     return YOLO(path)
 
 
-def detect_people(model, frame, imgsz=480, conf=PERSON_CONF):
-    """Trả về [(x1, y1, x2, y2, confidence)] cho các người có độ tin cậy >= conf.
+def detect_vehicles(model, frame, imgsz=IMGSZ, conf=DETECT_CONF):
+    """Trả về [(x1, y1, x2, y2, confidence)] cho các xe có độ tin cậy >= conf.
 
-    Dùng predict, không dùng track: ByteTrack bỏ mất người ngồi bị bàn/màn hình che
-    (test_video2: track 0/258 khung, predict 239/258). ID tracking không dùng cho logic zone.
+    Dùng predict, không dùng track: zone chỉ cần biết có xe hay không, không cần ID.
     """
-    results = model.predict(frame, conf=conf, imgsz=imgsz, classes=[PERSON_CLASS], verbose=False)
+    results = model.predict(frame, conf=conf, imgsz=imgsz, classes=VEHICLE_CLASSES, verbose=False)
     if not results or results[0].boxes is None:
         return []
     boxes = results[0].boxes
@@ -54,14 +57,37 @@ def detect_people(model, frame, imgsz=480, conf=PERSON_CONF):
             for (x1, y1, x2, y2), c in zip(boxes.xyxy.int().cpu().tolist(), boxes.conf.cpu().tolist())]
 
 
-def zones_occupied(people, zones):
-    """Zone có người nếu tâm bounding box nằm trong ROI [x, y, w, h]."""
+def zone_polygon(zone):
+    """[x, y, w, h] (từ cv2.selectROIs) hoặc [[x, y], ...] -> mảng điểm int32 của đa giác."""
+    if not isinstance(zone[0], (list, tuple)):
+        x, y, w, h = zone
+        zone = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+    return np.array(zone, np.int32)
+
+
+def zones_occupied(boxes, zones, min_iou=ZONE_IOU):
+    """Mỗi xe chiếm tối đa một chỗ: chỗ có IoU(bbox, đa giác chỗ đỗ) lớn nhất, nếu >= min_iou.
+
+    Camera nhìn xiên làm bbox xe lấn sang chỗ bên cạnh; xét tâm bbox hoặc chỉ phần giao sẽ đếm một xe cho hai chỗ.
+    """
+    masks = {}
+    for z, zone in zones.items():
+        pts = zone_polygon(zone)
+        x, y, w, h = cv2.boundingRect(pts)
+        mask = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(mask, [pts - (x, y)], 1)
+        masks[z] = (x, y, mask, int(mask.sum()))
     occupied = {z: False for z in zones}
-    for x1, y1, x2, y2, _ in people:
-        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-        for z, (zx, zy, zw, zh) in zones.items():
-            if zx <= cx <= zx + zw and zy <= cy <= zy + zh:
-                occupied[z] = True
+    for x1, y1, x2, y2, _ in boxes:
+        best, best_iou = None, min_iou
+        for z, (zx, zy, mask, area) in masks.items():
+            inter = int(mask[max(y1 - zy, 0):max(y2 - zy, 0), max(x1 - zx, 0):max(x2 - zx, 0)].sum())
+            if inter:
+                iou = inter / ((x2 - x1) * (y2 - y1) + area - inter)
+                if iou >= best_iou:
+                    best, best_iou = z, iou
+        if best is not None:
+            occupied[best] = True
     return occupied
 
 
@@ -77,7 +103,7 @@ def setup_rois(cap, path, force=False):
     print("[INFO] Kéo thả để vẽ từng vùng, ENTER/SPACE để chốt 1 vùng, ESC để hoàn tất.")
     rois = cv2.selectROIs("Select ROIs", frame, showCrosshair=True, fromCenter=False)
     cv2.destroyWindow("Select ROIs")
-    zones = {f"Zone_{i + 1}": [int(v) for v in roi] for i, roi in enumerate(rois)}
+    zones = {f"Slot_{i + 1}": [int(v) for v in roi] for i, roi in enumerate(rois)}
     if not zones:
         raise SystemExit("[LỖI] Không có vùng nào được chọn.")
     with open(path, "w", encoding="utf-8") as f:
@@ -86,23 +112,24 @@ def setup_rois(cap, path, force=False):
     return zones
 
 
-def draw(frame, people, zones, occupied, monitor, now):
-    for x1, y1, x2, y2, conf in people:
+def draw(frame, boxes, zones, occupied, monitor, now):
+    for x1, y1, x2, y2, conf in boxes:
         cv2.rectangle(frame, (x1, y1), (x2, y2), (200, 200, 200), 1)
         cv2.putText(frame, f"{conf:.2f}", (x1 + 2, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
     states = monitor.states()
-    for z, (zx, zy, zw, zh) in zones.items():
+    for z, zone in zones.items():
         state, since = states[z]
-        if state == OCCUPIED or occupied.get(z):
-            color, text = (0, 255, 0), f"{z}: Co nguoi"
-        elif state == VACANT:
-            absent = now - since
-            color = (0, 0, 255) if absent >= monitor.alert_s else (0, 255, 255)
-            text = f"{z} Vang: {int(absent)}s"
+        if state == OCCUPIED:
+            parked = now - since
+            color = (0, 0, 255) if parked >= monitor.alert_s else (0, 255, 255)
+            text = f"{z}: {int(parked // 60)}p"
+        elif state == VACANT and not occupied.get(z):
+            color, text = (0, 255, 0), f"{z}: trong"
         else:
             color, text = (200, 200, 200), f"{z}: ..."
-        cv2.rectangle(frame, (zx, zy), (zx + zw, zy + zh), color, 2)
-        cv2.putText(frame, text, (zx, zy - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        pts = zone_polygon(zone)
+        cv2.polylines(frame, [pts], True, color, 2)
+        cv2.putText(frame, text, tuple(int(v) for v in pts.min(axis=0)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
 
 def open_source(source):
@@ -118,8 +145,13 @@ def main():
     ap.add_argument("--roi", help="file ROI json")
     ap.add_argument("--model", default=default_model_path())
     ap.add_argument("--camera-id", default="Cam-01")
-    ap.add_argument("--imgsz", type=int, default=480)
-    ap.add_argument("--conf", type=float, default=PERSON_CONF, help="ngưỡng tin cậy tính là có người (chọn bằng evaluate.py)")
+    ap.add_argument("--imgsz", type=int, default=IMGSZ)
+    ap.add_argument("--every-s", type=float, default=DETECT_EVERY_S, help="khoảng cách giữa hai lần suy luận (giây)")
+    ap.add_argument("--conf", type=float, default=DETECT_CONF, help="ngưỡng tin cậy tính là có xe (chọn bằng eval_pklot.py)")
+    ap.add_argument("--iou", type=float, default=ZONE_IOU, help="IoU tối thiểu giữa xe và chỗ đỗ")
+    ap.add_argument("--enter-s", type=float, default=10.0, help="xe đứng yên bao lâu thì tính là đỗ")
+    ap.add_argument("--leave-s", type=float, default=10.0, help="mất xe bao lâu thì tính là đã rời")
+    ap.add_argument("--alert-s", type=float, default=7200.0, help="đỗ quá bao lâu thì cảnh báo")
     ap.add_argument("--headless", action="store_true", help="không hiển thị cửa sổ")
     args = ap.parse_args()
 
@@ -141,9 +173,9 @@ def main():
     # Video: dùng thời gian nội tại video (neo vào giờ thật lúc bắt đầu) để kết quả không phụ thuộc tốc độ máy.
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     t0 = time.time()
-    monitor = ZoneMonitor(zones, start=t0)
-    frame_idx, people, occupied = 0, [], {}
-    print(f"\n=== TRẠM GIÁM SÁT BIÊN: {len(zones)} vùng, nguồn {args.source} ===  'q' thoát, 'r' vẽ lại ROI\n")
+    monitor = ZoneMonitor(zones, args.enter_s, args.leave_s, args.alert_s, start=t0)
+    frame_idx, boxes, occupied, last_detect = 0, [], {}, float("-inf")
+    print(f"\n=== TRẠM GIÁM SÁT BIÊN: {len(zones)} chỗ đỗ, nguồn {args.source} ===  'q' thoát, 'r' vẽ lại ROI\n")
 
     while True:
         ret, frame = cap.read()
@@ -162,23 +194,24 @@ def main():
         if is_video and now > time.time():
             time.sleep(now - time.time())  # phát video đúng tốc độ thật để mô phỏng camera (timestamp không vượt giờ thật)
 
-        if frame_idx % (SKIP_FRAMES + 1) == 0:
+        if now - last_detect >= args.every_s:
+            last_detect = now
             try:
-                people = detect_people(model, frame, imgsz=args.imgsz, conf=args.conf)
+                boxes = detect_vehicles(model, frame, imgsz=args.imgsz, conf=args.conf)
             except Exception as e:  # lỗi suy luận 1 khung hình không được dừng cả trạm
-                print(f"[LỖI] Tracking: {e}")
-                people = []
-            occupied = zones_occupied(people, zones)
+                print(f"[LỖI] Suy luận: {e}")
+                boxes = []
+            occupied = zones_occupied(boxes, zones, args.iou)
             for ev in monitor.update(occupied, now):
                 publisher.publish_event(ev)
                 print(f"[SỰ KIỆN] {ev}")
                 if ev["event"] == ALERT:
-                    fname = f"missing_{ev['zone_id']}_{datetime.now():%Y%m%d_%H%M%S}.jpg"
+                    fname = f"overstay_{ev['zone_id']}_{datetime.now():%Y%m%d_%H%M%S}.jpg"
                     cv2.imwrite(os.path.join(snapshot_dir, fname), frame)
 
         if args.headless:
             continue
-        draw(frame, people, zones, occupied, monitor, now)
+        draw(frame, boxes, zones, occupied, monitor, now)
         cv2.imshow("Giam sat Bien - SmartFactory", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):

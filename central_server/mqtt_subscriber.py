@@ -18,7 +18,7 @@ PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER", "")
 MQTT_PASS = os.environ.get("MQTT_PASS", "")
 DB_PATH = os.environ.get("DB_PATH", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                                 "logs", "factory_alerts.db"))
+                                                 "logs", "parking.db"))
 LOCAL_TZ = timezone(timedelta(hours=float(os.environ.get("TZ_OFFSET_HOURS", "7"))))
 
 TOPIC_PREFIX = "smartfactory/vntt/line1"
@@ -51,8 +51,8 @@ def parse_message(topic, payload):
         if ev["event"] not in ZONE_EVENTS or not _is_name(data.get("zone_id")):
             return None
         ev["zone_id"] = data["zone_id"]
-        if _is_number(data.get("absent_s")):
-            ev["absent_s"] = float(data["absent_s"])
+        if _is_number(data.get("duration_s")):
+            ev["duration_s"] = float(data["duration_s"])
     elif topic.startswith(f"{TOPIC_PREFIX}/status/"):
         if ev["event"] not in STATUS_EVENTS:
             return None
@@ -67,11 +67,11 @@ def format_alert(ev):
     cam = html.escape(ev["camera_id"])
     if ev["event"] == "ALERT":
         zone = html.escape(ev["zone_id"])
-        absent = f"{ev['absent_s']:.0f}s" if "absent_s" in ev else "?"
-        return (f"🚨 <b>CẢNH BÁO NHÀ MÁY</b> 🚨\n\n⚠️ Trạm làm việc trống {absent}\n"
-                f"📍 Khu vực: {zone} ({cam})\n🕒 Thời gian: {when}")
+        parked = f"{ev['duration_s'] / 60:.0f} phút" if "duration_s" in ev else "?"
+        return (f"🚗 <b>XE ĐỖ QUÁ GIỜ</b>\n\n⏱️ Đã đỗ {parked}\n"
+                f"📍 Chỗ đỗ: {zone} ({cam})\n🕒 Thời gian: {when}")
     if ev["event"] == "OFFLINE":
-        return f"📴 <b>CAMERA MẤT KẾT NỐI</b>\n\n📷 {cam}\n🕒 Thời gian: {when}\nHệ thống KHÔNG giám sát khu vực này."
+        return f"📴 <b>CAMERA MẤT KẾT NỐI</b>\n\n📷 {cam}\n🕒 Thời gian: {when}\nHệ thống KHÔNG giám sát các chỗ đỗ của camera này."
     return None
 
 

@@ -1,7 +1,7 @@
 """
-eval_metrics.py — chấm sự kiện của ZoneMonitor với nhãn gold (khoảng vắng mặt do người gán tay).
+eval_metrics.py — chấm sự kiện của ZoneMonitor với nhãn gold (các lượt đỗ xe).
 
-Gold: {zone_id: [[start_s, end_s], ...]} theo thời gian video (giây). Ngoài các khoảng này = có người.
+Gold: {zone_id: [[start_s, end_s], ...]} theo thời gian (giây) — xe đỗ từ start đến end. Ngoài các khoảng này = trống.
 """
 import statistics
 
@@ -23,14 +23,14 @@ def _predicted_state(events, t):
     return state
 
 
-def score_zone(absences, events, duration, alert_s, tol=3.0):
+def score_zone(parked, events, duration, alert_s, tol=3.0):
     """
-    Cảnh báo đúng (TP): ALERT nằm trong một khoảng vắng gold dài >= alert_s, trong [start, end + tol].
-    Mỗi khoảng vắng gold chỉ khớp một ALERT; ALERT thừa hoặc ngoài khoảng vắng = báo giả (FP).
-    Khoảng vắng gold dài >= alert_s mà không có ALERT = bỏ sót (FN).
+    Cảnh báo đúng (TP): ALERT nằm trong một lượt đỗ gold dài >= alert_s, trong [start, end + tol].
+    Mỗi lượt đỗ gold chỉ khớp một ALERT; ALERT thừa hoặc ngoài lượt đỗ = báo giả (FP).
+    Lượt đỗ gold dài >= alert_s mà không có ALERT = bỏ sót (FN).
     """
     alerts = [e["ts"] for e in events if e["event"] == "ALERT"]
-    eligible = [(a, b) for a, b in absences if b - a >= alert_s]
+    eligible = [(a, b) for a, b in parked if b - a >= alert_s]
     matched, latencies, fp = set(), [], 0
     for t in alerts:
         hit = next((i for i, (a, b) in enumerate(eligible) if i not in matched and a <= t <= b + tol), None)
@@ -47,7 +47,7 @@ def score_zone(absences, events, duration, alert_s, tol=3.0):
         pred = _predicted_state(state_events, t)
         if pred is None:
             continue  # chưa đủ dữ liệu để kết luận (vài giây đầu)
-        gold = "VACANT" if _in_any(t, absences) else "OCCUPIED"
+        gold = "OCCUPIED" if _in_any(t, parked) else "VACANT"
         known += 1
         agree += pred == gold
         gold_occ += gold == "OCCUPIED"

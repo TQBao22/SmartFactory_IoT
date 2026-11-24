@@ -11,23 +11,24 @@ def ev(ts, event, zone="Z", cam="C"):
 
 
 class KpiTest(unittest.TestCase):
-    def test_occupancy_absence_alert_response(self):
-        events = [ev(0, "OCCUPIED"), ev(600, "VACANT"), ev(1200, "ALERT"), ev(1500, "OCCUPIED")]
+    def test_occupancy_dwell_overstay_response(self):
+        # Trống 0-600s, xe đỗ 600-1500s, quá giờ lúc 1200s, xe rời lúc 1500s.
+        events = [ev(0, "VACANT"), ev(600, "OCCUPIED"), ev(1200, "ALERT"), ev(1500, "VACANT")]
         s = compute_kpis(events, 0, 3600)[("C", "Z")]
-        self.assertEqual(s["occupied_s"], 600 + 2100)
-        self.assertEqual(s["vacant_s"], 900)
-        self.assertEqual(s["absences"], 1)
-        self.assertEqual(s["absence_s"], [900])
+        self.assertEqual(s["vacant_s"], 600 + 2100)
+        self.assertEqual(s["occupied_s"], 900)
+        self.assertEqual(s["arrivals"], 1)
+        self.assertEqual(s["dwell_s"], [900])
         self.assertEqual(s["alerts"], 1)
         self.assertEqual(s["response_s"], [300])
 
     def test_window_clips_and_uses_state_from_before(self):
-        # Vắng từ trước kỳ báo cáo, quay lại trong kỳ: thời gian vắng chỉ tính phần nằm trong kỳ.
-        events = [ev(0, "VACANT"), ev(150, "OCCUPIED")]
+        # Xe đỗ từ trước kỳ báo cáo, rời trong kỳ: chỉ tính phần nằm trong kỳ, không tính là lượt đến.
+        events = [ev(0, "OCCUPIED"), ev(150, "VACANT")]
         s = compute_kpis(events, 100, 200)[("C", "Z")]
-        self.assertEqual(s["vacant_s"], 50)
         self.assertEqual(s["occupied_s"], 50)
-        self.assertEqual(s["absences"], 0)  # bắt đầu vắng ngoài kỳ
+        self.assertEqual(s["vacant_s"], 50)
+        self.assertEqual(s["arrivals"], 0)
 
     def test_offline_time_is_not_counted(self):
         events = [ev(0, "OCCUPIED"), {"ts": 100, "camera_id": "C", "zone_id": None, "event": "OFFLINE"},
@@ -45,7 +46,7 @@ class KpiTest(unittest.TestCase):
 
     def test_table_renders(self):
         table = format_table(compute_kpis([ev(0, "OCCUPIED"), ev(1800, "VACANT")], 0, 3600))
-        self.assertIn("50.0", table)  # có mặt 50%
+        self.assertIn("50.0", table)  # lấp đầy 50%
 
 
 if __name__ == "__main__":

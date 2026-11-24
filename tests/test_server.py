@@ -18,8 +18,8 @@ def msg(**kw):
 
 class ParseMessageTest(unittest.TestCase):
     def test_valid_alert(self):
-        ev = sub.parse_message(EV, msg(camera_id="Cam-01", zone_id="Zone_1", event="ALERT", ts=100.0, absent_s=12.3))
-        self.assertEqual(ev, {"camera_id": "Cam-01", "zone_id": "Zone_1", "event": "ALERT", "ts": 100.0, "absent_s": 12.3})
+        ev = sub.parse_message(EV, msg(camera_id="Cam-01", zone_id="Zone_1", event="ALERT", ts=100.0, duration_s=7300.0))
+        self.assertEqual(ev, {"camera_id": "Cam-01", "zone_id": "Zone_1", "event": "ALERT", "ts": 100.0, "duration_s": 7300.0})
 
     def test_valid_status(self):
         ev = sub.parse_message(ST, msg(camera_id="Cam-01", event="OFFLINE", ts=5))
@@ -45,10 +45,10 @@ class ParseMessageTest(unittest.TestCase):
 
 class FormatAlertTest(unittest.TestCase):
     def test_escapes_html_from_edge(self):
-        text = sub.format_alert({"camera_id": "<b>x</b>", "zone_id": "Z&1", "event": "ALERT", "ts": 0, "absent_s": 15})
+        text = sub.format_alert({"camera_id": "<b>x</b>", "zone_id": "Z&1", "event": "ALERT", "ts": 0, "duration_s": 7500})
         self.assertIn("&lt;b&gt;x&lt;/b&gt;", text)
         self.assertIn("Z&amp;1", text)
-        self.assertIn("15s", text)
+        self.assertIn("125 phút", text)
 
     def test_only_alert_and_offline_notify(self):
         base = {"camera_id": "C", "zone_id": "Z", "ts": 0}
@@ -62,7 +62,7 @@ class DatabaseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             db = AlertDatabase(os.path.join(d, "x.db"))
             self.assertTrue(db.insert_event({"camera_id": "C", "zone_id": "Z", "event": "VACANT", "ts": 1.0}, 1.5))
-            row = db.conn.execute("SELECT ts, camera_id, zone_id, event, absent_s, received_at FROM events").fetchone()
+            row = db.conn.execute("SELECT ts, camera_id, zone_id, event, duration_s, received_at FROM events").fetchone()
             db.close()
         self.assertEqual(row, (1.0, "C", "Z", "VACANT", None, 1.5))
 

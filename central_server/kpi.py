@@ -1,10 +1,10 @@
 """
-kpi.py — KPI vận hành theo từng zone, tính từ bảng `events`.
+kpi.py — KPI bãi đỗ theo từng chỗ đỗ, tính từ bảng `events`.
 
     python kpi.py                                   # 24 giờ gần nhất
     python kpi.py --from "2026-11-24 08:00" --to "2026-11-24 17:00"
 
-Thời gian camera OFFLINE không tính vào có mặt lẫn vắng mặt.
+Thời gian camera OFFLINE không tính vào có xe lẫn trống.
 """
 import argparse
 import sqlite3
@@ -24,16 +24,16 @@ def _overlap(a, b, lo, hi):
 def compute_kpis(events, t_from, t_to):
     """
     events: [{ts, camera_id, zone_id, event}] (thứ tự bất kỳ).
-    Trả về {(camera_id, zone_id): {occupied_s, vacant_s, absences, absence_s: [...], alerts, response_s: [...]}}
-    - absences: số lần bắt đầu vắng trong khoảng thời gian.
-    - absence_s: độ dài các lần vắng đã kết thúc (người quay lại) trong khoảng.
-    - response_s: từ lúc cảnh báo đến lúc người quay lại.
+    Trả về {(camera_id, zone_id): {occupied_s, vacant_s, arrivals, dwell_s: [...], alerts, response_s: [...]}}
+    - arrivals: số lượt xe đến đỗ trong khoảng thời gian (độ quay vòng của chỗ đỗ).
+    - dwell_s: thời gian đỗ của các lượt đã kết thúc (xe rời đi) trong khoảng.
+    - response_s: từ lúc cảnh báo đỗ quá giờ đến lúc xe rời đi.
     """
     stats, cur = {}, {}  # cur[(cam, zone)] = [state, since, alert_ts]
 
     def zone_stats(key):
-        return stats.setdefault(key, {"occupied_s": 0.0, "vacant_s": 0.0, "absences": 0,
-                                      "absence_s": [], "alerts": 0, "response_s": []})
+        return stats.setdefault(key, {"occupied_s": 0.0, "vacant_s": 0.0, "arrivals": 0,
+                                      "dwell_s": [], "alerts": 0, "response_s": []})
 
     def close(key, until):
         state, since, _ = cur[key]
@@ -57,17 +57,17 @@ def compute_kpis(events, t_from, t_to):
         state, since, alert_ts = cur.get(key, [None, ts, None])
         if kind == ALERT:
             s["alerts"] += in_window
-            if state == VACANT:
+            if state == OCCUPIED:
                 cur[key][2] = ts
             continue
         if kind == state:
             continue
         if key in cur:
             close(key, ts)
-        if kind == VACANT:
-            s["absences"] += in_window
-        elif state == VACANT and in_window:
-            s["absence_s"].append(ts - since)
+        if kind == OCCUPIED:
+            s["arrivals"] += in_window
+        elif state == OCCUPIED and in_window:
+            s["dwell_s"].append(ts - since)
             if alert_ts is not None and ts >= alert_ts:
                 s["response_s"].append(ts - alert_ts)
         cur[key] = [kind, ts, None]
@@ -82,15 +82,15 @@ def _mean_min(values):
 
 
 def format_table(stats):
-    head = ["camera", "zone", "giờ quan sát", "có mặt %", "số lần vắng", "vắng TB (phút)", "vắng max (phút)",
-            "cảnh báo", "phản hồi TB (phút)"]
+    head = ["camera", "chỗ đỗ", "giờ quan sát", "lấp đầy %", "lượt xe", "đỗ TB (phút)", "đỗ max (phút)",
+            "quá giờ", "xử lý TB (phút)"]
     rows = [head]
     for (cam, zone), s in sorted(stats.items()):
         observed = s["occupied_s"] + s["vacant_s"]
         rows.append([cam, zone, f"{observed / 3600:.2f}",
                      f"{100 * s['occupied_s'] / observed:.1f}" if observed else "-",
-                     str(s["absences"]), _mean_min(s["absence_s"]),
-                     f"{max(s['absence_s']) / 60:.1f}" if s["absence_s"] else "-",
+                     str(s["arrivals"]), _mean_min(s["dwell_s"]),
+                     f"{max(s['dwell_s']) / 60:.1f}" if s["dwell_s"] else "-",
                      str(s["alerts"]), _mean_min(s["response_s"])])
     widths = [max(len(r[i]) for r in rows) for i in range(len(head))]
     return "\n".join("  ".join(c.ljust(w) for c, w in zip(r, widths)) for r in rows)
